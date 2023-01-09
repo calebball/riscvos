@@ -5,6 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 pub mod asm;
+pub mod page_allocator;
 pub mod serial;
 
 #[cfg(test)]
