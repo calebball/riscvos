@@ -1,31 +1,31 @@
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-const PAGE_SIZE: u64 = 4096;
+pub const PAGE_SIZE: u64 = 4096;
 
 extern "C" {
     pub static HEAP_START: u64;
     pub static HEAP_END: u64;
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PageAddr {
-    address: u64,
+    pub address: u64,
 }
 
 impl PageAddr {
-    fn as_mut_ptr(self) -> *mut u8 {
+    pub fn as_mut_ptr(self) -> *mut u8 {
         return self.address as *mut u8;
     }
 }
 
-struct PageRange {
+pub struct PageRange {
     next_page: u64,
     last_page: u64,
 }
 
 impl PageRange {
-    fn new(start: PageAddr, end: PageAddr) -> Self {
+    pub fn new(start: PageAddr, end: PageAddr) -> Self {
         Self {
             next_page: start.address,
             last_page: end.address,
@@ -85,10 +85,7 @@ impl PageAllocator {
                 }
 
                 unsafe {
-                    for i in 0..PAGE_SIZE {
-                        let byte_ptr = page_ptr.add(i as usize) as *mut u8;
-                        *byte_ptr = 0;
-                    }
+                    core::ptr::write_bytes(page_ptr as *mut u8, 0, PAGE_SIZE as usize);
                 }
 
                 Ok(page_address)
@@ -109,6 +106,16 @@ impl PageAllocator {
 
         self.free_list = Some(page_ptr)
     }
+
+    pub fn free_pages(&self) -> u64 {
+        let mut count = 0;
+        let mut node = self.free_list;
+        while let Some(page_ptr) = node {
+            node = unsafe { (*page_ptr).next };
+            count += 1;
+        }
+        count
+    }
 }
 
 unsafe impl Send for PageAllocator {}
@@ -120,17 +127,19 @@ lazy_static! {
                 PageAddr {
                     address: HEAP_START + PAGE_SIZE - (HEAP_START % PAGE_SIZE),
                 },
-                PageAddr { address: HEAP_END },
+                PageAddr {
+                    address: HEAP_END - 2 * PAGE_SIZE,
+                },
             )
         })
     };
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use super::*;
 
-    fn heap_addresses(size: u64) -> (PageAddr, PageAddr) {
+    pub fn heap_addresses(size: u64) -> (PageAddr, PageAddr) {
         let heap_start_address = unsafe { HEAP_START + PAGE_SIZE - (HEAP_START % PAGE_SIZE) };
         let heap_start = PageAddr {
             address: heap_start_address,
@@ -139,6 +148,12 @@ mod test {
             address: heap_start_address + (size - 1) * PAGE_SIZE,
         };
         (heap_start, heap_end)
+    }
+
+    pub fn test_page_allocator(pages: u64) -> PageAllocator {
+        let (heap_start, heap_end) = heap_addresses(pages);
+
+        unsafe { PageAllocator::new(heap_start, heap_end) }
     }
 
     #[test_case]
@@ -227,5 +242,37 @@ mod test {
 
         allocator.dealloc(page_two.unwrap());
         allocator.dealloc(page_one.unwrap());
+    }
+
+    #[test_case]
+    fn new_allocator_has_correct_number_of_pages() {
+        let (heap_start, heap_end) = heap_addresses(5);
+
+        let allocator = unsafe { PageAllocator::new(heap_start, heap_end) };
+
+        assert_eq!(allocator.free_pages(), 5);
+    }
+
+    #[test_case]
+    fn allocating_a_page_reduces_number_of_pages() {
+        let (heap_start, heap_end) = heap_addresses(5);
+
+        let mut allocator = unsafe { PageAllocator::new(heap_start, heap_end) };
+
+        let _ = allocator.alloc();
+
+        assert_eq!(allocator.free_pages(), 4);
+    }
+
+    #[test_case]
+    fn after_allocating_all_pages_no_free_pages_are_left() {
+        let (heap_start, heap_end) = heap_addresses(2);
+
+        let mut allocator = unsafe { PageAllocator::new(heap_start, heap_end) };
+
+        let _ = allocator.alloc();
+        let _ = allocator.alloc();
+
+        assert_eq!(allocator.free_pages(), 0);
     }
 }

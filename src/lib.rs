@@ -6,6 +6,7 @@
 
 pub mod asm;
 pub mod page_allocator;
+pub mod page_table;
 pub mod serial;
 
 #[cfg(test)]
