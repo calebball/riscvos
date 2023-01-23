@@ -57,6 +57,7 @@ pub enum PageAllocationError {
     NoPagesAvailable,
 }
 
+#[derive(Debug)]
 pub struct PageAllocator {
     free_list: Option<*mut FreePageNode>,
 }

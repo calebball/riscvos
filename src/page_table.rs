@@ -16,8 +16,9 @@ extern "C" {
     static HEAP_END: u64;
 }
 
+#[derive(Debug)]
 pub struct PhysicalAddress {
-    address: u64,
+    pub address: u64,
 }
 
 impl PhysicalAddress {
@@ -228,7 +229,7 @@ impl PageTableEntryBuilder {
     }
 }
 
-struct PageTable {
+pub struct PageTable {
     entries: [PageTableEntry; 512],
 }
 
@@ -243,22 +244,29 @@ impl PageTable {
         Ok(page)
     }
 
-    pub fn walk(&self, virt: VirtualAddress) -> Option<*mut PageTableEntry> {
+    pub fn walk(&mut self, virt: VirtualAddress) -> Option<*mut PageTableEntry> {
         self.do_walk(virt, 2)
     }
 
-    fn do_walk(&self, virt: VirtualAddress, level: u64) -> Option<*mut PageTableEntry> {
-        let mut pte = self.entries[virt.page_table_index(level) as usize];
+    fn do_walk(&mut self, virt: VirtualAddress, level: u64) -> Option<*mut PageTableEntry> {
+        let pte_idx = virt.page_table_index(level) as usize;
+        let pte = self.entries[pte_idx];
+        let pte_ptr =
+            unsafe { (ptr::addr_of_mut!(self.entries) as *mut PageTableEntry).add(pte_idx) };
 
         if level == 0 {
-            return Some(ptr::addr_of_mut!(pte));
+            return Some(pte_ptr);
         }
 
         if !pte.is_valid() {
             return None;
         }
 
-        let next: &PageTable = unsafe { &*((pte.physical_page() << 12) as *mut PageTable) };
+        let next: &mut PageTable = unsafe {
+            ((pte.physical_page() << 12) as *mut PageTable)
+                .as_mut()
+                .unwrap()
+        };
         next.do_walk(virt, level - 1)
     }
 
@@ -276,31 +284,59 @@ impl PageTable {
         level: u64,
         allocator: &mut PageAllocator,
     ) -> Result<*mut PageTableEntry, PageAllocationError> {
+        // println!(
+        //     "In table {:#0x} at level {}",
+        //     (self as *mut PageTable) as u64,
+        //     level
+        // );
         let pte_idx = virt.page_table_index(level) as usize;
-        let mut pte = self.entries[pte_idx];
+        let pte = self.entries[pte_idx];
+        let pte_ptr =
+            unsafe { (ptr::addr_of_mut!(self.entries) as *mut PageTableEntry).add(pte_idx) };
+
+        // println!("  Getting entry {}: {:#064b}", pte_idx, pte.value);
 
         if level == 0 {
-            return Ok(ptr::addr_of_mut!(pte));
+            // println!("  Entry at {:#0x}", ptr::addr_of_mut!(pte) as u64);
+            // println!(
+            //     "  Or maybe it should be {:#0x}",
+            //     ptr::addr_of!(self.entries) as u64 + (pte_idx * 8) as u64
+            // );
+            // println!("  Or even {:#0x}", pte_ptr as u64);
+            return Ok(pte_ptr);
         }
 
         let next: &mut PageTable = if !pte.is_valid() {
             let new_page = allocator.alloc()?;
-            self.entries[pte_idx] =
-                PageTableEntryBuilder::new(new_page.address, PageTableEntryMode::PageTablePointer)
-                    .build();
-            unsafe { &mut *(new_page.address as *mut PageTable) }
+            unsafe {
+                pte_ptr.write(
+                    PageTableEntryBuilder::new(
+                        new_page.address,
+                        PageTableEntryMode::PageTablePointer,
+                    )
+                    .build(),
+                );
+            }
+            unsafe { (new_page.address as *mut PageTable).as_mut().unwrap() }
         } else {
-            unsafe { &mut *((pte.physical_page() << 12) as *mut PageTable) }
+            unsafe {
+                ((pte.physical_page() << 12) as *mut PageTable)
+                    .as_mut()
+                    .unwrap()
+            }
         };
 
         next.do_walk_and_map(virt, level - 1, allocator)
     }
 }
 
-struct VirtualMemory {
-    page_allocator: PageAllocator,
-    root_table: *mut PageTable,
+#[derive(Debug)]
+pub struct VirtualMemory {
+    pub page_allocator: PageAllocator,
+    pub root_table: *mut PageTable,
 }
+
+unsafe impl Send for VirtualMemory {}
 
 impl VirtualMemory {
     pub fn new(mut page_allocator: PageAllocator) -> Result<Self, PageAllocationError> {
@@ -323,7 +359,7 @@ impl VirtualMemory {
         Ok(())
     }
 
-    fn map(
+    pub fn map(
         &mut self,
         virt: VirtualAddress,
         mode: PageTableEntryMode,
@@ -409,22 +445,21 @@ impl VirtualMemory {
                     address: 0x1000_0000,
                 },
                 PageTableEntryMode::ReadWrite,
-            )?
+            )?;
+
+            self.identity_map(
+                PageAddr {
+                    address: 0x0010_0000,
+                },
+                PageTableEntryMode::ReadWrite,
+            )?;
         }
         Ok(())
     }
 
-    pub fn enable(&self) {
-        use core::arch::asm;
-
-        let addr = ptr::addr_of!(self.root_table) as u64;
-        let satp = (8 << 60) | (addr >> 12);
-
-        unsafe {
-            asm!("csrw satp, {satp}", satp = in(reg) satp);
-            asm!("csrw mstatus, {status}", status = in(reg) 1 << 11);
-            asm!("mret");
-        }
+    pub fn satp(&self) -> u64 {
+        let addr = self.root_table as u64;
+        (8 << 60) | (addr >> 12)
     }
 }
 
@@ -443,7 +478,7 @@ mod test {
     #[test_case]
     fn walking_a_fresh_table_returns_none() {
         let mut allocator = test_page_allocator(10);
-        let table = unsafe { &*PageTable::new(&mut allocator).unwrap() };
+        let table = unsafe { PageTable::new(&mut allocator).unwrap().as_mut().unwrap() };
         assert_eq!(table.walk(0.try_into().unwrap()), None)
     }
 
@@ -467,17 +502,21 @@ mod test {
     }
 
     #[test_case]
+    fn walk_and_map_followed_by_walk_agrees() {
+        let mut allocator = test_page_allocator(128);
+        let table = unsafe { &mut *PageTable::new(&mut allocator).unwrap() };
+        let target_addr = 0x80001000;
+        let first_walk = table
+            .walk_and_map(target_addr.try_into().unwrap(), &mut allocator)
+            .unwrap() as u64;
+        let second_walk = table.walk(target_addr.try_into().unwrap()).unwrap() as u64;
+        assert_eq!(first_walk, second_walk);
+    }
+
+    #[test_case]
     fn initialising_virtual_memory_succeeds() {
         let allocator = test_page_allocator(128);
         let mut vm = VirtualMemory::new(allocator).unwrap();
         assert!(vm.init().is_ok());
-    }
-
-    #[test_case]
-    fn enabling_virtual_memory_succeeds() {
-        let allocator = test_page_allocator(128);
-        let mut vm = VirtualMemory::new(allocator).unwrap();
-        vm.init().unwrap();
-        vm.enable();
     }
 }

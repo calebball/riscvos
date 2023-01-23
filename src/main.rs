@@ -10,6 +10,8 @@ pub mod serial;
 #[cfg(test)]
 pub mod test;
 
+use riscvos::initialise_kernel;
+
 #[no_mangle]
 extern "C" fn kernel_main() -> ! {
     println!("ohhai");
@@ -34,9 +36,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     test::panic_handler(info);
 
     loop {}
-}
-
-#[test_case]
-fn succeeds() {
-    assert_eq!(1, 1);
 }
